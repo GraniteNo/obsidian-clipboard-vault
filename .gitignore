@@ -1,0 +1,16 @@
+node_modules/
+backups/
+outputs/
+work/
+
+# Local settings, credentials, and logs
+.env
+.env.*
+!.env.example
+.obsidian/
+.vscode/
+.idea/
+*.log
+*.tsbuildinfo
+.DS_Store
+Thumbs.db
