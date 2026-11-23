@@ -1,5 +1,5 @@
 import { App, FileSystemAdapter, ItemView, Menu, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile, TFolder, WorkspaceLeaf } from "obsidian";
-import { archiveDate, archiveEntries, archivePath, dayKey, detectKind, hasMarker, isImageFilePath, isSensitive, matchesKeyword, nextSequence, pad, recentDate, removeArchiveEntry, renderEntry, renderFileEntry, searchEntries, validRoot, type ArchiveFilter, type ArchiveLevel, type EntryKind, type SearchHit } from "./core";
+import { archiveDate, archiveEntries, archivePath, dayKey, detectKind, hasMarker, isImageFilePath, isSensitive, matchesKeyword, nextSequence, pad, recentDate, removeArchiveEntries, renderEntry, renderFileEntry, sameEntry, searchEntries, validRoot, type ArchiveFilter, type ArchiveLevel, type EntryKind, type SearchHit } from "./core";
 import { ARCHIVE_COPY_FORMAT, WindowsClipboardBridge, writeWindowsClipboard, type WindowsSnapshot } from "./windows-clipboard";
 
 declare const require: ((id: string) => unknown) | undefined;
@@ -127,6 +127,10 @@ async function readItems(items: readonly ClipboardItemLike[], images: boolean, t
   return null;
 }
 
+function entrySelectionKey(hit: SearchHit): string {
+  return JSON.stringify([hit.path, hit.kind, hit.hash, hit.title]);
+}
+
 class ClipboardView extends ItemView {
   private query = "";
   private dateScope: DateScope = "today";
@@ -135,9 +139,13 @@ class ClipboardView extends ItemView {
   private page = 0;
   private request = 0;
   private collapsedDates = new Set<string>();
+  private selectedHits = new Map<string, SearchHit>();
+  private visibleHits: SearchHit[] = [];
+  private selectionInputs = new Map<string, { input: HTMLInputElement; item: HTMLElement }>();
   private ui?: {
     status: HTMLElement; count: HTMLElement; path: HTMLElement; toggle: HTMLButtonElement;
     result: HTMLElement; list: HTMLElement; previous: HTMLButtonElement; next: HTMLButtonElement;
+    selectAll: HTMLInputElement; selectionCount: HTMLElement; clearSelection: HTMLButtonElement; removeSelected: HTMLButtonElement;
   };
 
   constructor(leaf: WorkspaceLeaf, private plugin: ClipboardVaultPlugin) { super(leaf); }
@@ -178,6 +186,8 @@ class ClipboardView extends ItemView {
     const run = () => {
       this.query = input.value.trim();
       this.page = 0;
+      this.selectedHits.clear();
+      this.updateSelection();
       void this.refresh();
     };
     search.addEventListener("click", run);
@@ -201,26 +211,77 @@ class ClipboardView extends ItemView {
     date.addEventListener("change", () => { this.date = date.value; run(); });
     kind.addEventListener("change", () => { this.kind = (kind.value || undefined) as EntryKind | undefined; run(); });
     const result = searchSection.createDiv({ cls: "clipboard-vault-result-count", attr: { "aria-live": "polite" } });
+    const selection = searchSection.createDiv({ cls: "clipboard-vault-actions clipboard-vault-selection", attr: { role: "group", "aria-label": "批量选择归档" } });
+    const selectAllLabel = selection.createEl("label", { cls: "clipboard-vault-select-all" });
+    const selectAll = selectAllLabel.createEl("input", { type: "checkbox" });
+    selectAllLabel.createEl("span", { text: "全选本页" });
+    const selectionCount = selection.createEl("span", { cls: "clipboard-vault-selection-count", attr: { "aria-live": "polite" } });
+    const clearSelection = selection.createEl("button", { text: "取消选择" });
+    const removeSelected = selection.createEl("button", { text: "删除所选", cls: "mod-warning" });
+    selectAll.addEventListener("change", () => {
+      for (const hit of this.visibleHits) {
+        if (!hit.range) continue;
+        if (selectAll.checked) this.selectedHits.set(entrySelectionKey(hit), hit);
+        else this.selectedHits.delete(entrySelectionKey(hit));
+      }
+      this.updateSelection();
+    });
+    clearSelection.addEventListener("click", () => { this.selectedHits.clear(); this.updateSelection(); });
+    removeSelected.addEventListener("click", () => {
+      this.plugin.confirmBatchRemoval([...this.selectedHits.values()], removed => {
+        for (const hit of removed) this.selectedHits.delete(entrySelectionKey(hit));
+        this.updateSelection();
+      });
+    });
     const list = searchSection.createDiv({ cls: "clipboard-vault-list" });
     const pages = searchSection.createDiv({ cls: "clipboard-vault-actions clipboard-vault-pages" });
     const previous = pages.createEl("button", { text: "上一页" });
     const next = pages.createEl("button", { text: "下一页" });
     previous.addEventListener("click", () => { this.page = Math.max(0, this.page - 1); void this.refresh(); });
     next.addEventListener("click", () => { this.page++; void this.refresh(); });
-    this.ui = { status, count, path, toggle, result, list, previous, next };
+    this.ui = { status, count, path, toggle, result, list, previous, next, selectAll, selectionCount, clearSelection, removeSelected };
+    this.updateSelection();
     await this.refresh();
   }
 
-  async onClose(): Promise<void> { this.ui = undefined; this.request++; }
+  async onClose(): Promise<void> {
+    this.ui = undefined;
+    this.request++;
+    this.selectedHits.clear();
+    this.selectionInputs.clear();
+    this.visibleHits = [];
+  }
 
-  async refresh(): Promise<void> {
+  private updateSelection(): void {
     const ui = this.ui;
     if (!ui) return;
+    const selectable = this.visibleHits.filter(hit => hit.range);
+    const count = selectable.filter(hit => this.selectedHits.has(entrySelectionKey(hit))).length;
+    ui.selectAll.checked = selectable.length > 0 && count === selectable.length;
+    ui.selectAll.indeterminate = count > 0 && count < selectable.length;
+    ui.selectAll.disabled = !selectable.length;
+    ui.selectionCount.setText(`已选 ${this.selectedHits.size} 条（可跨页）`);
+    ui.clearSelection.disabled = ui.removeSelected.disabled = !this.selectedHits.size;
+    for (const [key, { input, item }] of this.selectionInputs) {
+      input.checked = this.selectedHits.has(key);
+      item.classList.toggle("is-selected", input.checked);
+    }
+  }
+
+  async refresh(changedPaths?: ReadonlySet<string>): Promise<void> {
+    const ui = this.ui;
+    if (!ui) return;
+    if (changedPaths?.size) {
+      // Deletion renumbers a whole note; discard its old selections before showing the new headings.
+      for (const [key, hit] of this.selectedHits) if (changedPaths.has(hit.path)) this.selectedHits.delete(key);
+      this.updateSelection();
+    }
     const request = ++this.request;
     ui.status.setText(this.plugin.statusText());
     ui.path.setText(`保存位置：${this.plugin.dayFolder()}`);
     ui.toggle.setText(this.plugin.isMonitoring ? "暂停监控" : this.plugin.isTimedPaused ? "恢复监控" : "开始监控");
     ui.previous.disabled = ui.next.disabled = true;
+    ui.selectAll.disabled = true;
     const filter: ArchiveFilter = { kind: this.kind };
     const now = new Date();
     switch (this.dateScope) {
@@ -242,7 +303,15 @@ class ClipboardView extends ItemView {
         this.dateScope === "date" && !this.date ? "请选择日期。" : this.dateScope === "today" ?
           "今天没有符合条件的归档。可切换日期查看历史记录。" : "没有符合条件的归档。");
       ui.list.empty();
-      this.addDateGroups(ui.list, hits.slice(0, PAGE_SIZE), now);
+      this.selectionInputs.clear();
+      this.visibleHits = hits.slice(0, PAGE_SIZE);
+      for (const hit of this.visibleHits) {
+        const key = entrySelectionKey(hit);
+        const selected = this.selectedHits.get(key);
+        if (selected && (!hit.range || !sameEntry(hit, selected))) this.selectedHits.delete(key);
+      }
+      this.addDateGroups(ui.list, this.visibleHits, now);
+      this.updateSelection();
       ui.previous.disabled = this.page === 0;
       ui.next.disabled = hits.length <= PAGE_SIZE;
       ui.previous.hidden = ui.next.hidden = this.page === 0 && hits.length <= PAGE_SIZE;
@@ -281,6 +350,17 @@ class ClipboardView extends ItemView {
   private addHit(container: HTMLElement, hit: SearchHit): void {
     const item = container.createDiv({ cls: "clipboard-vault-hit" });
     const heading = item.createDiv({ cls: "clipboard-vault-hit-heading" });
+    if (hit.range) {
+      const key = entrySelectionKey(hit);
+      const input = heading.createEl("input", { type: "checkbox", cls: "clipboard-vault-hit-select",
+        attr: { "aria-label": `选择 ${archiveDate(hit.path)} · ${hit.title}` } });
+      this.selectionInputs.set(key, { input, item });
+      input.addEventListener("change", () => {
+        if (input.checked) this.selectedHits.set(key, hit);
+        else this.selectedHits.delete(key);
+        this.updateSelection();
+      });
+    }
     heading.createEl("strong", { text: hit.title });
     heading.createEl("span", { text: archiveDate(hit.path) });
     if (hit.snippet) item.createDiv({ text: hit.snippet, cls: "clipboard-vault-hit-snippet" });
@@ -315,27 +395,37 @@ class ClipboardView extends ItemView {
 }
 
 class RemoveEntryModal extends Modal {
-  constructor(private plugin: ClipboardVaultPlugin, private hit: SearchHit, private undo: boolean) { super(plugin.app); }
+  constructor(private plugin: ClipboardVaultPlugin, private hits: SearchHit[], private undo: boolean,
+    private onRemoved?: (removed: SearchHit[]) => void) { super(plugin.app); }
 
   onOpen(): void {
-    const action = this.undo ? "撤销最近捕获" : "删除条目";
+    const batch = this.hits.length > 1;
+    const action = this.undo ? "撤销最近捕获" : batch ? "批量删除条目" : "删除条目";
     this.titleEl.setText(action);
-    this.contentEl.createEl("p", { text: `${archiveDate(this.hit.path)} · ${this.hit.title}` });
-    if (this.hit.snippet) this.contentEl.createEl("p", { text: this.hit.snippet, cls: "clipboard-vault-remove-preview" });
+    if (batch) {
+      this.contentEl.createEl("p", { text: `将删除所选的 ${this.hits.length} 条归档，涉及 ${new Set(this.hits.map(hit => archiveDate(hit.path))).size} 个日期。` });
+      const preview = this.contentEl.createEl("ul", { cls: "clipboard-vault-remove-preview clipboard-vault-remove-list" });
+      for (const hit of this.hits) preview.createEl("li", { text: `${archiveDate(hit.path)} · ${hit.title}${hit.snippet ? `：${hit.snippet}` : ""}` });
+    } else {
+      const hit = this.hits[0];
+      this.contentEl.createEl("p", { text: `${archiveDate(hit.path)} · ${hit.title}` });
+      if (hit.snippet) this.contentEl.createEl("p", { text: hit.snippet, cls: "clipboard-vault-remove-preview" });
+    }
     this.contentEl.createEl("p", { text: "移除后，当天剩余条目将从 1 开始连续编号。" });
     let trashImages = false;
-    if (this.hit.images.length) {
+    if (this.hits.some(hit => hit.images.length)) {
       new Setting(this.contentEl).setName("同时移除独有的图片附件")
-        .setDesc("把此条目生成且未被其他笔记引用的图片移到回收站。")
+        .setDesc("把所选条目生成且未被其他笔记引用的图片移到回收站，默认保留附件。")
         .addToggle(toggle => toggle.setValue(false).onChange(value => { trashImages = value; }));
     }
     const buttons = this.contentEl.createDiv({ cls: "modal-button-container" });
     const cancel = buttons.createEl("button", { text: "取消" });
-    const confirm = buttons.createEl("button", { text: this.undo ? "确认撤销" : "确认删除", cls: "mod-warning" });
+    const confirm = buttons.createEl("button", { text: this.undo ? "确认撤销" : batch ? `确认删除 ${this.hits.length} 条` : "确认删除", cls: "mod-warning" });
     cancel.addEventListener("click", () => this.close());
     confirm.addEventListener("click", async () => {
       confirm.disabled = cancel.disabled = true;
-      await this.plugin.deleteEntry(this.hit, trashImages, this.undo);
+      const removed = await this.plugin.deleteEntries(this.hits, trashImages, this.undo);
+      this.onRemoved?.(removed);
       this.close();
     }, { once: true });
     cancel.focus();
@@ -854,7 +944,14 @@ export default class ClipboardVaultPlugin extends Plugin {
   confirmRemoval(hit: SearchHit, undo: boolean): void {
     if (!hit.range) { new Notice("此条目的格式已修改，请到原笔记中手动删除"); return; }
     this.removalModal?.close();
-    this.removalModal = new RemoveEntryModal(this, hit, undo);
+    this.removalModal = new RemoveEntryModal(this, [hit], undo);
+    this.removalModal.open();
+  }
+
+  confirmBatchRemoval(hits: SearchHit[], onRemoved: (removed: SearchHit[]) => void): void {
+    if (!hits.length) return;
+    this.removalModal?.close();
+    this.removalModal = new RemoveEntryModal(this, hits, false, onRemoved);
     this.removalModal.open();
   }
 
@@ -863,38 +960,57 @@ export default class ClipboardVaultPlugin extends Plugin {
   }
 
   async deleteEntry(hit: SearchHit, trashImages: boolean, undo: boolean): Promise<void> {
-    try {
-      const file = this.app.vault.getAbstractFileByPath(hit.path);
-      if (!(file instanceof TFile) || !hit.path.startsWith(`${this.settings.root}/`) || !archiveDate(hit.path)) {
-        new Notice("原归档笔记已移走或删除");
-        return;
+    await this.deleteEntries([hit], trashImages, undo);
+  }
+
+  async deleteEntries(hits: SearchHit[], trashImages: boolean, undo = false): Promise<SearchHit[]> {
+    const selected = [...new Map(hits.map(hit => [entrySelectionKey(hit), hit])).values()];
+    if (!selected.length) return [];
+    const groups = new Map<string, SearchHit[]>();
+    for (const hit of selected) {
+      const group = groups.get(hit.path) ?? [];
+      group.push(hit);
+      groups.set(hit.path, group);
+    }
+    const removed: SearchHit[] = [];
+    for (const [path, entries] of groups) {
+      try {
+        const file = this.app.vault.getAbstractFileByPath(path);
+        if (!(file instanceof TFile) || !path.startsWith(`${this.settings.root}/`) || !archiveDate(path)) continue;
+        let deleted: SearchHit[] = [];
+        await this.app.vault.process(file, markdown => {
+          const change = removeArchiveEntries(file.path, markdown, entries);
+          deleted = change.entries;
+          return change.markdown;
+        });
+        removed.push(...deleted);
+      } catch (error) {
+        console.warn("[Clipboard Vault] remove archive entries", path, error);
       }
-      let removed: SearchHit | undefined;
-      await this.app.vault.process(file, markdown => {
-        const change = removeArchiveEntry(file.path, markdown, hit);
-        removed = change?.entry;
-        return change?.markdown ?? markdown;
-      });
-      if (!removed) {
-        new Notice("条目已更改或找不到对应内容，未删除。请刷新后重试");
-        await this.refreshPanel();
-        return;
-      }
-      if (!trashImages || !removed.images.length) new Notice(undo ? "已撤销本次捕获" : "已删除条目");
-      else {
-        const count = await this.trashUnusedImages(removed).catch(error => {
+    }
+    // Finish all note edits first so references between selected entries are checked after deletion.
+    const images = new Set(removed.flatMap(hit => hit.images.map(image => `${hit.path.slice(0, hit.path.lastIndexOf("/"))}/${image}`)));
+    let trashed = 0;
+    if (trashImages) {
+      for (const hit of removed) {
+        if (!hit.images.length) continue;
+        trashed += await this.trashUnusedImages(hit).catch(error => {
           console.warn("[Clipboard Vault] check attachment references", error);
           return 0;
         });
-        const kept = new Set(removed.images).size - count;
-        const suffix = [count ? `${count} 张图片已移到回收站` : "", kept ? `${kept} 张图片未移动` : ""].filter(Boolean).join("，");
-        new Notice(`${undo ? "已撤销本次捕获" : "已删除条目"}${suffix ? ` · ${suffix}` : ""}`);
       }
-      await this.refreshPanel();
-    } catch (error) {
-      console.warn("[Clipboard Vault] remove archive entry", error);
-      new Notice("无法删除条目，请检查归档笔记是否可写");
     }
+    const skipped = selected.length - removed.length;
+    let message = removed.length ? (undo ? "已撤销本次捕获" : selected.length === 1 ? "已删除条目" : `已删除 ${removed.length} 条归档`) : "未删除任何条目";
+    if (skipped) message += ` · ${skipped} 条已更改、移走或无法写入，请刷新后重试`;
+    if (trashImages && images.size) {
+      const kept = images.size - trashed;
+      const suffix = [trashed ? `${trashed} 张图片已移到回收站` : "", kept ? `${kept} 张图片未移动` : ""].filter(Boolean).join("，");
+      message += ` · ${suffix}`;
+    }
+    new Notice(message);
+    await this.refreshPanel(new Set(removed.map(hit => hit.path))).catch(error => console.warn("[Clipboard Vault] refresh after removal", error));
+    return removed;
   }
 
   private async trashUnusedImages(hit: SearchHit): Promise<number> {
@@ -1012,9 +1128,9 @@ export default class ClipboardVaultPlugin extends Plugin {
     return keep;
   }
 
-  private async refreshPanel(): Promise<void> {
+  private async refreshPanel(changedPaths?: ReadonlySet<string>): Promise<void> {
     for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE)) {
-      if (leaf.view instanceof ClipboardView) await leaf.view.refresh();
+      if (leaf.view instanceof ClipboardView) await leaf.view.refresh(changedPaths);
     }
   }
 }

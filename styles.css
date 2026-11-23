@@ -109,6 +109,15 @@
 .clipboard-vault-filters [hidden],
 .clipboard-vault-pages [hidden] { display: none; }
 .clipboard-vault-result-count { margin: 12px 0 8px; color: var(--text-muted); font-size: 0.85rem; }
+.clipboard-vault-selection { margin: 0 0 12px; gap: 8px 10px; }
+.clipboard-vault-select-all { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+.clipboard-vault-select-all input,
+.clipboard-vault-hit-select { flex: 0 0 auto; margin: 0; align-self: center; }
+.clipboard-vault-selection-count { color: var(--text-muted); font-size: 0.8rem; }
+.clipboard-vault-hit.is-selected {
+  border-color: var(--interactive-accent);
+  box-shadow: inset 3px 0 0 var(--interactive-accent);
+}
 .clipboard-vault-hit-actions { margin-top: 8px; }
 .clipboard-vault-hit-actions .clipboard-vault-remove { color: var(--text-muted); }
 .clipboard-vault-hit-actions .clipboard-vault-remove:hover { color: var(--text-error); }
@@ -118,6 +127,8 @@
   background: var(--background-secondary);
   overflow-wrap: anywhere;
 }
+.clipboard-vault-remove-list { max-height: 240px; overflow-y: auto; padding-left: 28px; }
+.clipboard-vault-remove-list li + li { margin-top: 6px; }
 .clipboard-vault-gallery {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(min(100%, 105px), 1fr));

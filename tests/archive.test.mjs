@@ -193,6 +193,61 @@ assert.equal((await plugin.search("", { from: today, through: today, kind: "imag
 assert.equal(await plugin.store({ kind: "text", text: "After deletion" }, "9".repeat(64)), "已保存");
 assert.match(vault.getMarkdownFiles()[1].content, /## 3\. .*· 文本/);
 
+// Batch edits use one process call per note, preserve new captures, and continue after a failed note.
+const batchPath1 = "剪切板/1999/1999-01-01.md";
+const batchPath2 = "剪切板/1999/1999-01-02.md";
+const failedPath = "剪切板/1999/1999-01-03.md";
+const outsidePath = "私人笔记/1999-01-04.md";
+const manual = "# 手工添加的工作记录\r\n\r\n必须保留。\r\n\r\n";
+await vault.create(batchPath1, (plainClip("Batch first", 1, "a") + "\n" + plainClip("Keep middle", 2, "b") + "\n" + plainClip("Batch last", 3, "c")).replace(/\n/g, "\r\n") + manual);
+await vault.create(batchPath2, plainClip("Batch other date", 1, "a") + "\n" + plainClip("Edited later", 2, "d"));
+await vault.create(failedPath, plainClip("Read only", 1, "e"));
+await vault.create(outsidePath, plainClip("Outside archive", 1, "f"));
+const firstDate = (await plugin.search("", { from: "1999-01-01", through: "1999-01-01" }, 10)).reverse();
+const otherDate = await plugin.search("", { from: "1999-01-02", through: "1999-01-02" }, 10);
+const failedHit = (await plugin.search("Read only"))[0];
+const outsideHit = { ...firstDate[0], path: outsidePath };
+const failedNote = records.get(failedPath);
+const failedContent = failedNote.content;
+records.get(batchPath1).content += plainClip("Captured while selecting", 4, "e").replace(/\n/g, "\r\n");
+records.get(batchPath2).content = records.get(batchPath2).content.replace("Edited later", "Edited after selection");
+const processCalls = [];
+const originalProcess = vault.process;
+vault.process = async (file, callback) => {
+  processCalls.push(file.path);
+  if (file.path === failedPath) throw new Error("Simulated read-only note");
+  return originalProcess(file, callback);
+};
+const originalWarn = console.warn;
+let batchRemoved;
+try {
+  console.warn = () => {};
+  batchRemoved = await plugin.deleteEntries([firstDate[0], firstDate[2], ...otherDate, failedHit, outsideHit, firstDate[0]], false);
+} finally {
+  vault.process = originalProcess;
+  console.warn = originalWarn;
+}
+assert.equal(batchRemoved.length, 3);
+assert.deepEqual(processCalls, [batchPath1, batchPath2, failedPath]);
+assert.ok(records.get(batchPath1).content.includes(manual));
+assert.ok(records.get(batchPath1).content.includes("Captured while selecting"));
+assert.deepEqual((await plugin.search("", { from: "1999-01-01", through: "1999-01-01" }, 10)).map(hit => hit.title.match(/^\d+/)[0]), ["2", "1"]);
+assert.ok(records.get(batchPath2).content.includes("Edited after selection"));
+assert.ok(!records.get(batchPath2).content.includes("Batch other date"));
+assert.equal(failedNote.content, failedContent);
+assert.ok(records.get(outsidePath).content.includes("Outside archive"));
+
+// A shared attachment can be trashed only after all selected references have been removed.
+const batchImage = "剪切板/1998/attachments/010000-aaaaaaaaaaaa.png";
+const imageNote = number => "<!-- clipboard-vault:image:" + "a".repeat(64) + " -->\n## " + number + ". 01:00:00 · 图片\n\n![](attachments/010000-aaaaaaaaaaaa.png)\n\n";
+await vault.createBinary(batchImage, png);
+await vault.create("剪切板/1998/1998-01-01.md", imageNote(1));
+await vault.create("剪切板/1998/1998-01-02.md", imageNote(1));
+const batchImages = await plugin.search("", { from: "1998-01-01", through: "1998-01-02" }, 10);
+assert.equal((await plugin.deleteEntries(batchImages, true)).length, 2);
+assert.ok(!records.has(batchImage));
+assert.equal(trashed.filter(path => path === batchImage).length, 1);
+
 // Timed pause and restart use a fake clock; no system clipboard or active Vault is touched.
 const originalNow = Date.now;
 let tickNow = originalNow();

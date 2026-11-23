@@ -102,4 +102,34 @@ const single = core.renderEntry("text", "最后一条", "4".repeat(64), date, 9)
 const emptyArchive = core.removeArchiveEntry(path, single, core.archiveEntries(path, single)[0]).markdown;
 assert.equal(core.archiveEntries(path, emptyArchive).length, 0);
 assert.equal(core.nextSequence(emptyArchive), 1);
+
+// Select from the original version: removing early entries must not invalidate later selections.
+for (const newline of ["\n", "\r\n"]) {
+  const batchSource = makeGapped(2, 12, 26).replace(/\n/g, newline);
+  const batchHits = core.archiveEntries(path, batchSource);
+  const batch = core.removeArchiveEntries(path, batchSource, [batchHits[0], batchHits[2], batchHits[0]]);
+  assert.equal(batch.entries.length, 2);
+  const remaining = core.archiveEntries(path, batch.markdown);
+  assert.equal(remaining.length, 1);
+  assert.equal(remaining[0].title, "1. 11:26:30 · 代码");
+  assert.equal(remaining[0].text, codeText.trimEnd());
+  assert.ok(batch.markdown.startsWith(preface.replace(/\n/g, newline)));
+  assert.equal(core.nextSequence(batch.markdown), 2);
+  const all = core.removeArchiveEntries(path, batchSource, batchHits);
+  assert.equal(all.entries.length, 3);
+  assert.equal(core.archiveEntries(path, all.markdown).length, 0);
+  assert.ok(all.markdown.includes(preface.replace(/\n/g, newline)));
+  assert.equal(core.nextSequence(all.markdown), 1);
+  const changedSource = batchSource.replace("正文有 12.", "正文被修改");
+  const partial = core.removeArchiveEntries(path, changedSource, batchHits);
+  assert.equal(partial.entries.length, 2);
+  assert.ok(partial.markdown.includes("正文被修改"));
+  assert.equal(core.archiveEntries(path, partial.markdown).length, 1);
+  assert.equal(core.removeArchiveEntries(path, batchSource, batchHits.map(hit => ({ ...hit, path: "别的笔记.md" }))).markdown, batchSource);
+  assert.equal(core.removeArchiveEntries(path, batchSource, []).markdown, batchSource);
+}
+const sameHashSource = core.renderEntry("text", "重复内容", hash, date, 1) + core.renderEntry("text", "重复内容", hash, date, 2);
+assert.equal(core.removeArchiveEntries(path, sameHashSource, core.archiveEntries(path, sameHashSource)).entries.length, 2);
+const ambiguousSource = single + single;
+assert.equal(core.removeArchiveEntries(path, ambiguousSource, core.archiveEntries(path, ambiguousSource)).entries.length, 0);
 console.log("Core checks passed");

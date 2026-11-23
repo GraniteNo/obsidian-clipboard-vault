@@ -240,11 +240,27 @@ export function renumberArchiveEntries(markdown: string): string {
 export function removeArchiveEntry(path: string, markdown: string, hit: SearchHit): {
   markdown: string; entry: SearchHit;
 } | null {
-  const matches = archiveEntries(path, markdown).filter(entry => sameEntry(entry, hit));
-  if (matches.length !== 1 || !matches[0].range) return null;
-  const entry = matches[0];
-  const { start, end } = entry.range!;
-  return { markdown: renumberArchiveEntries(markdown.slice(0, start) + markdown.slice(end)), entry };
+  const change = removeArchiveEntries(path, markdown, [hit]);
+  return change.entries.length ? { markdown: change.markdown, entry: change.entries[0] } : null;
+}
+
+export function removeArchiveEntries(path: string, markdown: string, hits: SearchHit[]): {
+  markdown: string; entries: SearchHit[];
+} {
+  const current = archiveEntries(path, markdown);
+  const selected = new Map<number, SearchHit>();
+  for (const hit of hits) {
+    if (hit.path !== path) continue;
+    const matches = current.filter(entry => sameEntry(entry, hit));
+    if (matches.length === 1 && matches[0].range) selected.set(matches[0].range.start, matches[0]);
+  }
+  // Resolve every selection against the same version before removing or renumbering anything.
+  const entries = [...selected.values()].sort((a, b) => b.range!.start - a.range!.start);
+  for (const entry of entries) {
+    const { start, end } = entry.range!;
+    markdown = markdown.slice(0, start) + markdown.slice(end);
+  }
+  return { markdown: entries.length ? renumberArchiveEntries(markdown) : markdown, entries };
 }
 
 export function nextSequence(markdown: string): number {
