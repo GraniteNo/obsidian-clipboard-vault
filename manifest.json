@@ -1,7 +1,7 @@
 {
   "id": "clipboard-vault",
   "name": "Clipboard Vault",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "minAppVersion": "1.5.0",
   "description": "Capture clipboard text, links, code, and images into daily Markdown notes.",
   "author": "Martian",

@@ -132,4 +132,33 @@ const sameHashSource = core.renderEntry("text", "重复内容", hash, date, 1) +
 assert.equal(core.removeArchiveEntries(path, sameHashSource, core.archiveEntries(path, sameHashSource)).entries.length, 2);
 const ambiguousSource = single + single;
 assert.equal(core.removeArchiveEntries(path, ambiguousSource, core.archiveEntries(path, ambiguousSource)).entries.length, 0);
+
+// Cleanup helpers.
+assert.deepEqual(core.cleanupScopeKinds("image"), ["image"]);
+assert.deepEqual(core.cleanupScopeKinds("text"), ["text", "url", "code", "files"]);
+assert.deepEqual(core.cleanupScopeKinds("all"), ["text", "url", "code", "image", "files"]);
+
+const cleanupHash = "abcdef0123456789".repeat(4);
+assert.equal(core.ownedAttachmentName(`112630-${cleanupHash.slice(0, 12)}.png`, cleanupHash), true);
+assert.equal(core.ownedAttachmentName(`112630-${cleanupHash.slice(0, 12)}-1-2.webp`, cleanupHash), true);
+assert.equal(core.ownedAttachmentName(`112630-${cleanupHash.slice(0, 12)}.png`, "0".repeat(64)), false);
+assert.equal(core.ownedAttachmentName(`112630-${cleanupHash.slice(0, 12)}.png`, "not-a-hash"), false);
+assert.equal(core.ownedAttachmentName(`我的截图.png`, cleanupHash), false);
+assert.equal(core.ownedAttachmentName(`../112630-${cleanupHash.slice(0, 12)}.png`, cleanupHash), false);
+assert.equal(core.ownedAttachmentName("112630-abcdef012345.png"), true);
+assert.equal(core.ownedAttachmentName("112630-abcdef012345-1-2.webp"), true);
+assert.equal(core.ownedAttachmentName("我的截图.png"), false);
+assert.equal(core.ownedAttachmentName("112630-abcdef01234.png"), false);
+
+assert.equal(core.validDay("2026-11-25"), "2026-11-25");
+assert.equal(core.validDay(" 2026-02-28 "), "2026-02-28");
+assert.equal(core.validDay("2026-02-30"), "");
+assert.equal(core.validDay("2026-2-3"), "");
+assert.equal(core.validDay(""), "");
+
+assert.equal(core.formatSize(0), "0 B");
+assert.equal(core.formatSize(512), "512 B");
+assert.equal(core.formatSize(1536), "1.5 KB");
+assert.equal(core.formatSize(34.2 * 1024 * 1024), "34.2 MB");
+assert.equal(core.formatSize(2 * 1024 * 1024 * 1024), "2.0 GB");
 console.log("Core checks passed");

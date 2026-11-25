@@ -1,5 +1,5 @@
 import { App, FileSystemAdapter, ItemView, Menu, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile, TFolder, WorkspaceLeaf } from "obsidian";
-import { archiveDate, archiveEntries, archivePath, dayKey, detectKind, hasMarker, isImageFilePath, isSensitive, matchesKeyword, nextSequence, pad, recentDate, removeArchiveEntries, renderEntry, renderFileEntry, sameEntry, searchEntries, validRoot, type ArchiveFilter, type ArchiveLevel, type EntryKind, type SearchHit } from "./core";
+import { archiveDate, archiveEntries, archivePath, cleanupScopeKinds, dayKey, detectKind, formatSize, hasMarker, isImageFilePath, isSensitive, matchesKeyword, nextSequence, ownedAttachmentName, pad, recentDate, removeArchiveEntries, renderEntry, renderFileEntry, sameEntry, searchEntries, timeKey, validDay, validRoot, type ArchiveFilter, type ArchiveLevel, type CleanupScope, type EntryKind, type SearchHit } from "./core";
 import { ARCHIVE_COPY_FORMAT, WindowsClipboardBridge, writeWindowsClipboard, type WindowsSnapshot } from "./windows-clipboard";
 
 declare const require: ((id: string) => unknown) | undefined;
@@ -10,6 +10,9 @@ const MAX_IMAGE_FILE_BYTES = 50 * 1024 * 1024;
 const MAX_IMAGE_BATCH_BYTES = 200 * 1024 * 1024;
 const PAGE_SIZE = 30;
 const PAUSE_MINUTES = [5, 15, 30] as const;
+const CLEANUP_INTERVALS = [1, 3, 7] as const;
+const CLEANUP_CHECK_MS = 30 * 60 * 1000;
+const CLEANUP_BACKUP_KEEP = 10;
 type PauseMinutes = typeof PAUSE_MINUTES[number];
 type DateScope = "all" | "today" | "yesterday" | "week" | "date";
 type ImageFileMode = "attachment" | "path";
@@ -28,6 +31,11 @@ interface Settings {
   filterSensitive: boolean;
   ignoreKeywords: string;
   maxTextLength: number;
+  cleanupAuto: boolean;
+  cleanupEveryDays: number;
+  cleanupOlderThanDays: number;
+  cleanupScope: CleanupScope;
+  cleanupLastRun: number;
 }
 
 const DEFAULTS: Settings = {
@@ -43,7 +51,12 @@ const DEFAULTS: Settings = {
   dedupeDay: true,
   filterSensitive: true,
   ignoreKeywords: "",
-  maxTextLength: 50000
+  maxTextLength: 50000,
+  cleanupAuto: false,
+  cleanupEveryDays: 7,
+  cleanupOlderThanDays: 30,
+  cleanupScope: "image",
+  cleanupLastRun: 0
 };
 
 type Snapshot = Exclude<WindowsSnapshot, null>;
@@ -175,6 +188,7 @@ class ClipboardView extends ItemView {
     const open = actions.createEl("button", { text: "打开今日归档" });
     open.addEventListener("click", () => void this.plugin.openToday());
     actions.createEl("button", { text: "撤销最近捕获" }).addEventListener("click", () => void this.plugin.undoLatest());
+    actions.createEl("button", { text: "清理…" }).addEventListener("click", () => this.plugin.openCleanupModal());
 
     const searchSection = root.createDiv({ cls: "clipboard-vault-section" });
     searchSection.createEl("h3", { text: "浏览归档" });
@@ -434,6 +448,160 @@ class RemoveEntryModal extends Modal {
   onClose(): void { this.contentEl.empty(); this.plugin.releaseRemoval(this); }
 }
 
+const CLEANUP_KINDS: Array<[EntryKind, string]> = [
+  ["image", "图片"], ["text", "文本"], ["url", "链接"], ["code", "代码"], ["files", "文件路径"]
+];
+
+class CleanupModal extends Modal {
+  private mode: "day" | "range" = "range";
+  private day = dayKey(new Date());
+  private from = recentDate(30);
+  private through = recentDate(1);
+  private kinds = new Set<EntryKind>(CLEANUP_KINDS.map(([kind]) => kind));
+  private hits: SearchHit[] = [];
+  private request = 0;
+  private ui!: {
+    day: HTMLInputElement; from: HTMLInputElement; through: HTMLInputElement;
+    summary: HTMLElement; detail: HTMLElement; run: HTMLButtonElement;
+  };
+
+  constructor(private plugin: ClipboardVaultPlugin) { super(plugin.app); }
+
+  onOpen(): void {
+    this.titleEl.setText("清理归档");
+    const { contentEl } = this;
+    contentEl.createEl("p", { text: "先预览，确认后才会删除。图片只在没有其他笔记引用时才移到回收站；受影响的笔记会先备份到 .cleanup-backup。" });
+
+    const scopeRow = contentEl.createDiv({ cls: "clipboard-vault-cleanup-row" });
+    const mode = scopeRow.createEl("select", { attr: { "aria-label": "清理范围" } });
+    mode.createEl("option", { text: "日期范围", value: "range" });
+    mode.createEl("option", { text: "指定日期", value: "day" });
+    mode.value = this.mode;
+    const day = scopeRow.createEl("input", { type: "date", attr: { "aria-label": "清理哪一天" } });
+    day.value = this.day;
+    const from = scopeRow.createEl("input", { type: "date", attr: { "aria-label": "起始日期" } });
+    from.value = this.from;
+    const through = scopeRow.createEl("input", { type: "date", attr: { "aria-label": "结束日期" } });
+    through.value = this.through;
+    day.hidden = this.mode !== "day";
+    from.hidden = through.hidden = this.mode !== "range";
+    mode.addEventListener("change", () => { this.mode = mode.value === "day" ? "day" : "range"; void this.updatePreview(); });
+    day.addEventListener("change", () => { this.day = day.value; void this.updatePreview(); });
+    from.addEventListener("change", () => { this.from = from.value; void this.updatePreview(); });
+    through.addEventListener("change", () => { this.through = through.value; void this.updatePreview(); });
+
+    const typeRow = contentEl.createDiv({ cls: "clipboard-vault-cleanup-types", attr: { role: "group", "aria-label": "清理类型" } });
+    for (const [kind, label] of CLEANUP_KINDS) {
+      const item = typeRow.createEl("label", { cls: "clipboard-vault-cleanup-type" });
+      const box = item.createEl("input", { type: "checkbox", attr: { "aria-label": `清理${label}` } });
+      box.checked = true;
+      item.createEl("span", { text: label });
+      box.addEventListener("change", () => {
+        if (box.checked) this.kinds.add(kind);
+        else this.kinds.delete(kind);
+        void this.updatePreview();
+      });
+    }
+
+    const summary = contentEl.createDiv({ cls: "clipboard-vault-cleanup-summary", attr: { "aria-live": "polite" } });
+    const detail = contentEl.createDiv({ cls: "clipboard-vault-cleanup-detail" });
+    const buttons = contentEl.createDiv({ cls: "modal-button-container" });
+    const cancel = buttons.createEl("button", { text: "取消" });
+    cancel.addEventListener("click", () => this.close());
+    const run = buttons.createEl("button", { text: "执行清理", cls: "mod-warning" });
+    run.disabled = true;
+    run.addEventListener("click", () => void this.execute());
+    this.ui = { day, from, through, summary, detail, run };
+    void this.updatePreview();
+  }
+
+  private range(): { from?: string; through?: string } | null {
+    if (this.mode === "day") {
+      const day = validDay(this.ui.day.value);
+      return day ? { from: day, through: day } : null;
+    }
+    const from = validDay(this.ui.from.value);
+    const through = validDay(this.ui.through.value);
+    return from && through && from <= through ? { from, through } : null;
+  }
+
+  private async updatePreview(): Promise<void> {
+    const ui = this.ui;
+    const request = ++this.request;
+    ui.day.hidden = this.mode !== "day";
+    ui.from.hidden = ui.through.hidden = this.mode !== "range";
+    this.hits = [];
+    ui.run.disabled = true;
+    const range = this.range();
+    if (!range) {
+      ui.summary.setText(this.mode === "day" ? "请选择日期。" : "请选择有效的起止日期，起始不能晚于结束。");
+      ui.detail.empty();
+      return;
+    }
+    if (!this.kinds.size) {
+      ui.summary.setText("请至少选择一种类型。");
+      ui.detail.empty();
+      return;
+    }
+    ui.summary.setText("正在统计…");
+    try {
+      const hits = await this.plugin.collectCleanupHits(range, this.kinds);
+      const stats = await this.plugin.cleanupStats(hits);
+      if (request !== this.request) return;
+      if (!hits.length) {
+        ui.summary.setText("这段时间没有符合条件的归档。");
+        ui.detail.empty();
+        return;
+      }
+      this.hits = hits;
+      ui.summary.setText(`将清理 ${stats.entries} 条 · 图片 ${stats.images} 张 · 约 ${formatSize(stats.bytes)}`);
+      const groups = new Map<string, number>();
+      for (const hit of hits) {
+        const date = archiveDate(hit.path);
+        groups.set(date, (groups.get(date) ?? 0) + 1);
+      }
+      const dates = [...groups.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+      ui.detail.empty();
+      for (const [date, count] of dates.slice(0, 12)) ui.detail.createDiv({ text: `${date} · ${count} 条` });
+      if (dates.length > 12) ui.detail.createDiv({ text: `…另有 ${dates.length - 12} 天` });
+      ui.run.disabled = false;
+    } catch (error) {
+      if (request !== this.request) return;
+      console.warn("[Clipboard Vault] cleanup preview", error);
+      ui.summary.setText("读取归档失败，请重试。");
+      ui.detail.empty();
+    }
+  }
+
+  private async execute(): Promise<void> {
+    const ui = this.ui;
+    const hits = this.hits;
+    if (!hits.length) return;
+    ui.run.disabled = true;
+    ui.run.setText("正在清理…");
+    try {
+      const result = await this.plugin.applyCleanup(hits, true);
+      let message = result.removed ? `已清理 ${result.removed} 条，${result.trashed} 张图片移到回收站` : "未删除任何条目";
+      if (result.skipped) message += ` · ${result.skipped} 条已更改或无法写入，已跳过`;
+      if (result.backup) message += " · 原笔记已备份";
+      new Notice(message);
+      this.close();
+    } catch (error) {
+      console.warn("[Clipboard Vault] cleanup", error);
+      ui.run.disabled = false;
+      ui.run.setText("执行清理");
+      new Notice("清理失败，请查看开发者控制台");
+    }
+  }
+
+  onClose(): void {
+    this.request++;
+    this.hits = [];
+    this.contentEl.empty();
+    this.plugin.releaseCleanup(this);
+  }
+}
+
 export default class ClipboardVaultPlugin extends Plugin {
   settings: Settings = { ...DEFAULTS };
   private timer: number | null = null;
@@ -452,6 +620,10 @@ export default class ClipboardVaultPlugin extends Plugin {
   private pendingNative: WindowsSnapshot | undefined;
   private openingPanel: Promise<void> | null = null;
   private removalModal: RemoveEntryModal | null = null;
+  private cleanupModal: CleanupModal | null = null;
+  private cleanupTimer: number | null = null;
+  private cleanupKick: number | null = null;
+  private cleanupBusy = false;
 
   get isMonitoring(): boolean { return this.timer !== null; }
   get isTimedPaused(): boolean { return this.settings.enabled && this.settings.pauseUntil > 0; }
@@ -464,6 +636,10 @@ export default class ClipboardVaultPlugin extends Plugin {
     if (!["attachment", "path"].includes(this.settings.imageFileMode)) this.settings.imageFileMode = "attachment";
     this.settings.intervalMs = Math.max(500, Math.min(10000, Number(this.settings.intervalMs) || 1000));
     this.settings.maxTextLength = Math.max(1000, Math.min(500000, Number(this.settings.maxTextLength) || 50000));
+    if (!CLEANUP_INTERVALS.includes(this.settings.cleanupEveryDays as typeof CLEANUP_INTERVALS[number])) this.settings.cleanupEveryDays = 7;
+    this.settings.cleanupOlderThanDays = Math.max(1, Math.min(3650, Number(this.settings.cleanupOlderThanDays) || 30));
+    if (!["image", "text", "all"].includes(this.settings.cleanupScope)) this.settings.cleanupScope = "image";
+    if (!Number.isFinite(this.settings.cleanupLastRun) || this.settings.cleanupLastRun < 0) this.settings.cleanupLastRun = 0;
     if (!this.settings.enabled || !Number.isFinite(this.settings.pauseUntil) || this.settings.pauseUntil <= 0) this.settings.pauseUntil = 0;
     this.clipboard = desktopClipboard();
     this.registerView(VIEW_TYPE, leaf => new ClipboardView(leaf, this));
@@ -481,13 +657,21 @@ export default class ClipboardVaultPlugin extends Plugin {
     this.addCommand({ id: "capture-now", name: "立即捕获剪切板", callback: () => void this.captureNow() });
     this.addCommand({ id: "open-archive", name: "打开今日剪切板归档", callback: () => void this.openToday() });
     this.addCommand({ id: "undo-capture", name: "撤销最近一次剪切板捕获", callback: () => void this.undoLatest() });
+    this.addCommand({ id: "cleanup-archive", name: "清理归档（按日期和类型）", callback: () => this.openCleanupModal() });
     this.addSettingTab(new ClipboardSettingsTab(this.app, this));
+    this.scheduleCleanup();
     this.updateStatus();
     if (this.isTimedPaused && this.settings.pauseUntil > Date.now()) this.scheduleResume();
     else if (this.settings.enabled) await this.startMonitoring(false);
   }
 
-  onunload(): void { this.stopMonitor(); this.clearResumeTimer(); this.removalModal?.close(); }
+  onunload(): void {
+    this.stopMonitor();
+    this.clearResumeTimer();
+    this.clearCleanupTimer();
+    this.removalModal?.close();
+    this.cleanupModal?.close();
+  }
 
   private clearTimer(): void {
     if (this.timer !== null) window.clearInterval(this.timer);
@@ -801,6 +985,20 @@ export default class ClipboardVaultPlugin extends Plugin {
     return `attachments/${target.split("/").at(-1)}`;
   }
 
+  // Same image bytes always produce the same file name, so one copy serves every entry of the day.
+  private async reuseOrCreateAttachment(bytes: Uint8Array, folder: string, contentHash: string,
+    extension: string, now: Date): Promise<string> {
+    await this.ensureFolder(folder);
+    const existing = this.app.vault.getAbstractFileByPath(folder);
+    if (existing instanceof TFolder) {
+      const match = existing.children.find((child): child is TFile =>
+        child instanceof TFile && ownedAttachmentName(child.name, contentHash));
+      if (match) return `attachments/${match.name}`;
+    }
+    const stem = `${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}-${contentHash.slice(0, 12)}`;
+    return this.createAttachment(bytes, folder, stem, extension);
+  }
+
   private async store(snapshot: Snapshot, hash: string): Promise<string> {
     const now = new Date();
     const kind: EntryKind = snapshot.kind === "image" ? "image" : snapshot.kind === "files" ? "files" : detectKind(snapshot.text);
@@ -820,21 +1018,24 @@ export default class ClipboardVaultPlugin extends Plugin {
     await this.ensureFolder(this.dayFolder(now));
     let file = this.app.vault.getAbstractFileByPath(path);
     if (file && !(file instanceof TFile)) throw new Error(`归档路径被文件夹占用：${path}`);
-    if (this.settings.dedupeDay && file instanceof TFile && hasMarker(await this.app.vault.read(file), kind, hash)) return "今日已保存相同内容";
+    // Image files are deduplicated by content, so their check runs after the bytes are read.
+    if (snapshot.kind !== "files" && this.settings.dedupeDay && file instanceof TFile &&
+      hasMarker(await this.app.vault.read(file), kind, hash)) return "今日已保存相同内容";
 
+    let entryHash = hash;
     let render: (sequence: number) => string;
     if (snapshot.kind === "image") {
-      const folder = `${this.dayFolder(now)}/attachments`;
-      const stem = `${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}-${hash.slice(0, 12)}`;
-      const content = await this.createAttachment(snapshot.bytes, folder, stem, ".png");
+      const content = await this.reuseOrCreateAttachment(snapshot.bytes, `${this.dayFolder(now)}/attachments`,
+        await digest("image", snapshot.bytes), ".png", now);
       render = sequence => renderEntry("image", content, hash, now, sequence);
     } else if (snapshot.kind === "files") {
       const paths: string[] = [];
       const attachments: string[] = [];
+      const contents: string[] = [];
       const reader = this.settings.imageFileMode === "attachment" && this.settings.captureImages ? fileReader() : null;
       let totalBytes = 0;
       let failed = 0;
-      for (const [index, sourcePath] of snapshot.paths.entries()) {
+      for (const sourcePath of snapshot.paths) {
         if (this.settings.imageFileMode !== "attachment" || !this.settings.captureImages || !isImageFilePath(sourcePath)) {
           paths.push(sourcePath);
           continue;
@@ -848,9 +1049,10 @@ export default class ClipboardVaultPlugin extends Plugin {
           const bytes = await reader.readFile(sourcePath);
           if (bytes.length > MAX_IMAGE_FILE_BYTES || totalBytes + bytes.length > MAX_IMAGE_BATCH_BYTES) throw new Error("图片文件超过导入上限");
           const extension = sourcePath.match(/\.[^.\\/]+$/)?.[0].toLowerCase() ?? ".png";
-          const stem = `${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}-${hash.slice(0, 12)}-${index + 1}`;
-          const relative = await this.createAttachment(bytes, `${this.dayFolder(now)}/attachments`, stem, extension);
+          const contentHash = await digest("image", bytes);
+          const relative = await this.reuseOrCreateAttachment(bytes, `${this.dayFolder(now)}/attachments`, contentHash, extension, now);
           attachments.push(relative);
+          contents.push(contentHash);
           totalBytes += bytes.length;
         } catch (error) {
           console.warn("[Clipboard Vault] 图片文件导入失败", error);
@@ -859,7 +1061,12 @@ export default class ClipboardVaultPlugin extends Plugin {
         }
       }
       if (failed) new Notice(`${failed} 张图片未能导入附件，已保存原路径`);
-      render = sequence => renderFileEntry(paths, attachments, hash, now, sequence);
+      // The same picture renamed or copied from another folder hashes the same, so it is not stored twice.
+      entryHash = await digest("files", new TextEncoder().encode(
+        [this.settings.imageFileMode, ...[...contents].sort(), ...[...paths].sort()].join("\u0000")));
+      if (this.settings.dedupeDay && file instanceof TFile &&
+        hasMarker(await this.app.vault.read(file), "files", entryHash)) return "今日已保存相同内容";
+      render = sequence => renderFileEntry(paths, attachments, entryHash, now, sequence);
     } else {
       const content = snapshot.text.slice(0, this.settings.maxTextLength);
       render = sequence => renderEntry(kind, content, hash, now, sequence, snapshot.text.length > this.settings.maxTextLength);
@@ -867,7 +1074,7 @@ export default class ClipboardVaultPlugin extends Plugin {
     const header = `# 剪切板归档 · ${dayKey(now)}\n\n`;
     if (file instanceof TFile) {
       await this.app.vault.process(file, current => {
-        if (this.settings.dedupeDay && hasMarker(current, kind, hash)) return current;
+        if (this.settings.dedupeDay && hasMarker(current, kind, entryHash)) return current;
         return `${current.trimEnd()}\n\n${render(nextSequence(current))}`;
       });
     } else {
@@ -891,6 +1098,8 @@ export default class ClipboardVaultPlugin extends Plugin {
     const prefix = `${this.settings.root}/`;
     return this.app.vault.getMarkdownFiles().filter(file => {
       if (!file.path.startsWith(prefix)) return false;
+      // Hidden folders such as .cleanup-backup are never part of the archive.
+      if (file.path.slice(prefix.length).split("/").some(part => part.startsWith("."))) return false;
       const date = archiveDate(file.path);
       return date && (!filter.from || date >= filter.from) && (!filter.through || date <= filter.through);
     }).sort((a, b) => archiveDate(b.path).localeCompare(archiveDate(a.path)) || b.path.localeCompare(a.path));
@@ -966,6 +1175,24 @@ export default class ClipboardVaultPlugin extends Plugin {
   async deleteEntries(hits: SearchHit[], trashImages: boolean, undo = false): Promise<SearchHit[]> {
     const selected = [...new Map(hits.map(hit => [entrySelectionKey(hit), hit])).values()];
     if (!selected.length) return [];
+    const { removed, trashed } = await this.removeEntries(selected, trashImages);
+    const images = new Set(removed.flatMap(hit => hit.images.map(image => `${hit.path.slice(0, hit.path.lastIndexOf("/"))}/${image}`)));
+    const skipped = selected.length - removed.length;
+    let message = removed.length ? (undo ? "已撤销本次捕获" : selected.length === 1 ? "已删除条目" : `已删除 ${removed.length} 条归档`) : "未删除任何条目";
+    if (skipped) message += ` · ${skipped} 条已更改、移走或无法写入，请刷新后重试`;
+    if (trashImages && images.size) {
+      const kept = images.size - trashed;
+      const suffix = [trashed ? `${trashed} 张图片已移到回收站` : "", kept ? `${kept} 张图片未移动` : ""].filter(Boolean).join("，");
+      message += ` · ${suffix}`;
+    }
+    new Notice(message);
+    await this.refreshPanel(new Set(removed.map(hit => hit.path))).catch(error => console.warn("[Clipboard Vault] refresh after removal", error));
+    return removed;
+  }
+
+  private async removeEntries(hits: SearchHit[], trashImages: boolean): Promise<{ removed: SearchHit[]; trashed: number }> {
+    const selected = [...new Map(hits.map(hit => [entrySelectionKey(hit), hit])).values()];
+    if (!selected.length) return { removed: [], trashed: 0 };
     const groups = new Map<string, SearchHit[]>();
     for (const hit of selected) {
       const group = groups.get(hit.path) ?? [];
@@ -989,7 +1216,6 @@ export default class ClipboardVaultPlugin extends Plugin {
       }
     }
     // Finish all note edits first so references between selected entries are checked after deletion.
-    const images = new Set(removed.flatMap(hit => hit.images.map(image => `${hit.path.slice(0, hit.path.lastIndexOf("/"))}/${image}`)));
     let trashed = 0;
     if (trashImages) {
       for (const hit of removed) {
@@ -1000,26 +1226,14 @@ export default class ClipboardVaultPlugin extends Plugin {
         });
       }
     }
-    const skipped = selected.length - removed.length;
-    let message = removed.length ? (undo ? "已撤销本次捕获" : selected.length === 1 ? "已删除条目" : `已删除 ${removed.length} 条归档`) : "未删除任何条目";
-    if (skipped) message += ` · ${skipped} 条已更改、移走或无法写入，请刷新后重试`;
-    if (trashImages && images.size) {
-      const kept = images.size - trashed;
-      const suffix = [trashed ? `${trashed} 张图片已移到回收站` : "", kept ? `${kept} 张图片未移动` : ""].filter(Boolean).join("，");
-      message += ` · ${suffix}`;
-    }
-    new Notice(message);
-    await this.refreshPanel(new Set(removed.map(hit => hit.path))).catch(error => console.warn("[Clipboard Vault] refresh after removal", error));
-    return removed;
+    return { removed, trashed };
   }
 
   private async trashUnusedImages(hit: SearchHit): Promise<number> {
-    const prefix = hit.hash.slice(0, 12);
-    const owned = new RegExp(`^\\d{6}-${prefix}(?:-\\d+){0,2}\\.[a-z0-9]+$`, "i");
     const candidates = new Map<string, TFile>();
     for (const relative of new Set(hit.images)) {
       const file = this.entryImage(hit, relative);
-      if (file && owned.test(file.name)) candidates.set(file.path, file);
+      if (file && ownedAttachmentName(file.name)) candidates.set(file.path, file);
     }
     if (!candidates.size) return 0;
     const resolved = this.app.metadataCache.resolvedLinks;
@@ -1030,6 +1244,8 @@ export default class ClipboardVaultPlugin extends Plugin {
     for (const note of this.app.vault.getFiles()) {
       if (!candidates.size) return 0;
       if (!["md", "canvas", "base"].includes(note.extension.toLowerCase())) continue;
+      // Hidden files (e.g. .cleanup-backup copies) are not real references.
+      if (note.path.split("/").some(part => part.startsWith("."))) continue;
       const text = (await (note.path === hit.path ? this.app.vault.read(note) : this.app.vault.cachedRead(note))).toLowerCase();
       const decoded = text.includes("%") ? text.replace(/%([0-9a-f]{2})/g, (_, code: string) => String.fromCharCode(parseInt(code, 16))).toLowerCase() : text;
       for (const [path, file] of candidates) {
@@ -1043,6 +1259,118 @@ export default class ClipboardVaultPlugin extends Plugin {
       catch (error) { console.warn("[Clipboard Vault] trash attachment", error); }
     }
     return count;
+  }
+
+  openCleanupModal(): void {
+    this.cleanupModal?.close();
+    this.cleanupModal = new CleanupModal(this);
+    this.cleanupModal.open();
+  }
+
+  releaseCleanup(modal: CleanupModal): void {
+    if (this.cleanupModal === modal) this.cleanupModal = null;
+  }
+
+  clearCleanupTimer(): void {
+    if (this.cleanupTimer !== null) window.clearInterval(this.cleanupTimer);
+    if (this.cleanupKick !== null) window.clearTimeout(this.cleanupKick);
+    this.cleanupTimer = null;
+    this.cleanupKick = null;
+  }
+
+  scheduleCleanup(): void {
+    this.clearCleanupTimer();
+    if (!this.settings.cleanupAuto) return;
+    this.cleanupTimer = window.setInterval(() => void this.runAutoCleanup(), CLEANUP_CHECK_MS);
+    this.cleanupKick = window.setTimeout(() => void this.runAutoCleanup(), 60000);
+  }
+
+  private async runAutoCleanup(): Promise<void> {
+    if (!this.settings.cleanupAuto || this.cleanupBusy) return;
+    if (this.settings.cleanupLastRun && Date.now() - this.settings.cleanupLastRun < this.settings.cleanupEveryDays * 86400000) return;
+    this.cleanupBusy = true;
+    try {
+      const hits = await this.collectCleanupHits({ through: recentDate(this.settings.cleanupOlderThanDays, new Date()) },
+        new Set(cleanupScopeKinds(this.settings.cleanupScope)));
+      this.settings.cleanupLastRun = Date.now();
+      await this.saveSettings();
+      if (!hits.length) return;
+      const result = await this.applyCleanup(hits, true);
+      new Notice(`自动清理：删除 ${result.removed} 条，${result.trashed} 张图片移到回收站`);
+    } catch (error) {
+      console.warn("[Clipboard Vault] auto cleanup", error);
+    } finally {
+      this.cleanupBusy = false;
+    }
+  }
+
+  async collectCleanupHits(range: { from?: string; through?: string }, kinds: ReadonlySet<EntryKind>): Promise<SearchHit[]> {
+    if (!kinds.size) return [];
+    const hits: SearchHit[] = [];
+    for (const file of this.archiveFiles(range)) {
+      const entries = archiveEntries(file.path, await this.app.vault.cachedRead(file));
+      for (const entry of entries) if (entry.range && kinds.has(entry.kind)) hits.push(entry);
+    }
+    return hits;
+  }
+
+  async cleanupStats(hits: SearchHit[]): Promise<{ entries: number; images: number; bytes: number }> {
+    const paths = new Set<string>();
+    for (const hit of hits) {
+      const parent = hit.path.slice(0, hit.path.lastIndexOf("/"));
+      for (const image of hit.images) paths.add(`${parent}/${image}`);
+    }
+    let bytes = 0;
+    for (const path of paths) {
+      try {
+        const info = await this.app.vault.adapter.stat(path);
+        if (info) bytes += info.size;
+      } catch { /* Missing or unreadable attachment. */ }
+    }
+    return { entries: hits.length, images: paths.size, bytes };
+  }
+
+  async applyCleanup(hits: SearchHit[], backup: boolean): Promise<{ removed: number; trashed: number; skipped: number; backup?: string }> {
+    const selected = [...new Map(hits.map(hit => [entrySelectionKey(hit), hit])).values()];
+    if (!selected.length) return { removed: 0, trashed: 0, skipped: 0 };
+    const folder = backup ? await this.backupNotes(new Set(selected.map(hit => hit.path))) : undefined;
+    const { removed, trashed } = await this.removeEntries(selected, true);
+    await this.refreshPanel(new Set(removed.map(hit => hit.path))).catch(error => console.warn("[Clipboard Vault] refresh after cleanup", error));
+    return { removed: removed.length, trashed, skipped: selected.length - removed.length, backup: folder };
+  }
+
+  private async backupNotes(paths: ReadonlySet<string>): Promise<string | undefined> {
+    const now = new Date();
+    const folder = `${this.settings.root}/.cleanup-backup/${dayKey(now)}-${timeKey(now).replace(/:/g, "")}`;
+    let written = 0;
+    for (const path of paths) {
+      const file = this.app.vault.getAbstractFileByPath(path);
+      if (!(file instanceof TFile)) continue;
+      const relative = path.startsWith(`${this.settings.root}/`) ? path.slice(this.settings.root.length + 1) : file.name;
+      const target = `${folder}/${relative}`;
+      try {
+        await this.ensureFolder(target.slice(0, target.lastIndexOf("/")));
+        await this.app.vault.create(target, await this.app.vault.read(file));
+        written++;
+      } catch (error) {
+        console.warn("[Clipboard Vault] cleanup backup", path, error);
+        throw new Error(`清理前备份失败，已停止清理：${path}`);
+      }
+    }
+    if (written) await this.pruneBackups().catch(() => {});
+    return written ? folder : undefined;
+  }
+
+  private async pruneBackups(): Promise<void> {
+    const parent = this.app.vault.getAbstractFileByPath(`${this.settings.root}/.cleanup-backup`);
+    if (!(parent instanceof TFolder)) return;
+    const folders = parent.children
+      .filter((child): child is TFolder => child instanceof TFolder && /^\d{4}-\d{2}-\d{2}-\d{6}$/.test(child.name))
+      .sort((a, b) => b.name.localeCompare(a.name));
+    for (const folder of folders.slice(CLEANUP_BACKUP_KEEP)) {
+      try { await this.app.vault.delete(folder, true); }
+      catch (error) { console.warn("[Clipboard Vault] prune cleanup backup", folder.path, error); }
+    }
   }
 
   async openEntry(hit: SearchHit): Promise<void> {
@@ -1202,5 +1530,44 @@ class ClipboardSettingsTab extends PluginSettingTab {
         this.plugin.settings.maxTextLength = number;
         await this.plugin.saveSettings();
       }));
+
+    containerEl.createEl("h3", { text: "清理" });
+    containerEl.createEl("p", { text: "删除旧归档以控制体积。图片只在没有其他笔记引用时才移到回收站；每次清理前会把受影响的笔记备份到保存根目录下的 .cleanup-backup。" });
+    new Setting(containerEl).setName("自动清理").setDesc("按下面的间隔自动删除旧归档。")
+      .addToggle(toggle => toggle.setValue(this.plugin.settings.cleanupAuto).onChange(async value => {
+        this.plugin.settings.cleanupAuto = value;
+        await this.plugin.saveSettings();
+        this.plugin.scheduleCleanup();
+      }));
+    new Setting(containerEl).setName("自动清理间隔")
+      .addDropdown(dropdown => dropdown
+        .addOption("1", "每天")
+        .addOption("3", "每 3 天")
+        .addOption("7", "每周")
+        .setValue(String(this.plugin.settings.cleanupEveryDays))
+        .onChange(async value => {
+          this.plugin.settings.cleanupEveryDays = Number(value) || 7;
+          await this.plugin.saveSettings();
+          this.plugin.scheduleCleanup();
+        }));
+    new Setting(containerEl).setName("清理多少天以前的内容").setDesc("最近 N 天不会被自动清理；允许 1–3650，默认 30。")
+      .addText(text => text.setValue(String(this.plugin.settings.cleanupOlderThanDays)).onChange(async value => {
+        const number = Number(value);
+        if (!Number.isInteger(number) || number < 1 || number > 3650) return;
+        this.plugin.settings.cleanupOlderThanDays = number;
+        await this.plugin.saveSettings();
+      }));
+    new Setting(containerEl).setName("自动清理类型")
+      .addDropdown(dropdown => dropdown
+        .addOption("image", "只清图片")
+        .addOption("text", "只清文字")
+        .addOption("all", "图片和文字都清")
+        .setValue(this.plugin.settings.cleanupScope)
+        .onChange(async value => {
+          this.plugin.settings.cleanupScope = value as CleanupScope;
+          await this.plugin.saveSettings();
+        }));
+    new Setting(containerEl).setName("手动清理").setDesc("选择日期和类型，先预览再删除。")
+      .addButton(button => button.setButtonText("打开清理面板").onClick(() => this.plugin.openCleanupModal()));
   }
 }

@@ -298,3 +298,39 @@ export function searchEntries(path: string, markdown: string, query: string, lim
   return entries.filter(hit => matchesKind(hit, kind) && (!needle ||
     [hit.title, hit.text, ...hit.images].join("\n").toLowerCase().includes(needle))).slice(0, limit);
 }
+
+export type CleanupScope = "image" | "text" | "all";
+
+export function cleanupScopeKinds(scope: CleanupScope): EntryKind[] {
+  if (scope === "image") return ["image"];
+  if (scope === "text") return ["text", "url", "code", "files"];
+  return ["text", "url", "code", "image", "files"];
+}
+
+// Attachments are named HHMMSS-<contentHash12>[-n][-n].ext by this plugin; anything else is left alone.
+// Pass a hash to also require that the name belongs to that exact content.
+export function ownedAttachmentName(name: string, hash?: string): boolean {
+  let prefix = "[a-f0-9]{12}";
+  if (hash !== undefined) {
+    if (!/^[a-f0-9]{64}$/i.test(hash)) return false;
+    prefix = hash.slice(0, 12);
+  }
+  return new RegExp(`^\\d{6}-${prefix}(?:-\\d+){0,2}\\.[a-z0-9]+$`, "i").test(name);
+}
+
+export function validDay(value: string): string {
+  const text = value.trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) return "";
+  const [year, month, day] = text.split("-").map(Number);
+  const date = new Date(year, month - 1, day);
+  return date.getFullYear() === year && date.getMonth() === month - 1 && date.getDate() === day ? text : "";
+}
+
+export function formatSize(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit++; }
+  return `${unit === 0 || value >= 100 ? Math.round(value) : value.toFixed(1)} ${units[unit]}`;
+}

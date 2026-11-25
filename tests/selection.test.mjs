@@ -159,5 +159,47 @@ assert.equal(inputs().length, 0);
 assert.equal(view.ui.selectAll.disabled, true);
 await view.onClose();
 assert.equal(view.selectedHits.size, 0);
+
+// The cleanup modal previews the selection and only deletes after confirmation.
+const previewHits = [
+  { path: "剪切板/2026-01-01.md", title: "1. 01:00:00 · 图片", kind: "image", hash: "a".repeat(64), line: 1,
+    text: "", images: ["attachments/010000-aaaaaaaaaaaa.png"], snippet: "", range: { start: 0, end: 10 } },
+  { path: "剪切板/2026-01-01.md", title: "2. 01:00:01 · 文本", kind: "text", hash: "b".repeat(64), line: 8,
+    text: "hi", images: [], snippet: "hi", range: { start: 10, end: 20 } }
+];
+plugin.collectCleanupHits = async (range, kinds) => previewHits.filter(hit => kinds.has(hit.kind));
+plugin.cleanupStats = async hits => ({
+  entries: hits.length,
+  images: hits.some(hit => hit.images.length) ? 1 : 0,
+  bytes: hits.length ? 34.2 * 1024 * 1024 : 0
+});
+let cleaned;
+plugin.applyCleanup = async (hits, backup) => {
+  cleaned = { hits, backup };
+  return { removed: 2, trashed: 1, skipped: 0, backup: "剪切板/.cleanup-backup/2026-01-01-000000" };
+};
+plugin.openCleanupModal();
+const cleanupModal = plugin.cleanupModal;
+await new Promise(resolve => setImmediate(resolve));
+assert.equal(cleanupModal.titleEl.text, "清理归档");
+const cleanupSummary = () => cleanupModal.contentEl.all(el => el.classes.has("clipboard-vault-cleanup-summary"))[0].text;
+const cleanupRun = () => cleanupModal.contentEl.all(el => el.tag === "button" && el.text === "执行清理")[0];
+assert.match(cleanupSummary(), /将清理 2 条 · 图片 1 张 · 约 34\.2 MB/);
+assert.equal(cleanupRun().disabled, false);
+const boxes = cleanupModal.contentEl.all(el => el.type === "checkbox");
+assert.equal(boxes.length, 5);
+const toggle = async (box, checked) => { box.checked = checked; await box.fire("change"); };
+await toggle(boxes[0], false);
+assert.match(cleanupSummary(), /将清理 1 条 · 图片 0 张/);
+for (const box of boxes.slice(1)) await toggle(box, false);
+assert.match(cleanupSummary(), /请至少选择一种类型/);
+assert.equal(cleanupRun().disabled, true);
+for (const box of boxes) await toggle(box, true);
+assert.match(cleanupSummary(), /将清理 2 条 · 图片 1 张/);
+assert.equal(cleanupRun().disabled, false);
+await cleanupRun().fire("click");
+assert.equal(cleaned.hits.length, 2);
+assert.equal(cleaned.backup, true);
+assert.equal(plugin.cleanupModal, null);
 plugin.onunload();
 console.log("Archive multi-selection and confirmation checks passed");

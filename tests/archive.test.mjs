@@ -6,7 +6,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const nodeRequire = createRequire(import.meta.url);
-class TFolder { constructor(path) { this.path = path; } }
+class TFolder {
+  constructor(path) { this.path = path; }
+  get children() {
+    const prefix = `${this.path}/`;
+    return [...records.values()].filter(value => value.path.startsWith(prefix) && !value.path.slice(prefix.length).includes("/"));
+  }
+}
 class TFile {
   constructor(path, content = "") {
     this.path = path;
@@ -35,7 +41,8 @@ const vault = {
   async process(file, callback) { file.content = callback(file.content); return file.content; },
   getFiles() { return [...records.values()].filter(value => value instanceof TFile); },
   getMarkdownFiles() { return this.getFiles().filter(value => value.path.endsWith(".md")); },
-  async trash(file, system) { assert.equal(system, true); records.delete(file.path); trashed.push(file.path); }
+  async trash(file, system) { assert.equal(system, true); records.delete(file.path); trashed.push(file.path); },
+  adapter: { async stat(path) { return records.has(path) ? { size: 1234 } : null; } }
 };
 const app = { vault, metadataCache: { resolvedLinks: {} }, workspace: { getLeavesOfType: () => [] } };
 const module = { exports: {} };
@@ -76,9 +83,10 @@ const temporary = await mkdtemp(join(tmpdir(), "clipboard-vault-test-"));
 const sample = join(temporary, "sample.png");
 const sample2 = join(temporary, "second.jpg");
 const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScL/nwAAAABJRU5ErkJggg==", "base64");
+const png2 = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64");
 try {
   await writeFile(sample, png);
-  await writeFile(sample2, png);
+  await writeFile(sample2, png2);
   plugin.settings.imageFileMode = "attachment";
   const attachmentHash = await plugin.fingerprint({ kind: "files", paths: [sample] });
   plugin.settings.imageFileMode = "path";
@@ -247,6 +255,103 @@ const batchImages = await plugin.search("", { from: "1998-01-01", through: "1998
 assert.equal((await plugin.deleteEntries(batchImages, true)).length, 2);
 assert.ok(!records.has(batchImage));
 assert.equal(trashed.filter(path => path === batchImage).length, 1);
+
+// The same image bytes are recognised by content: a rename or another folder never stores it twice.
+{
+  const dedupeDir = await mkdtemp(join(tmpdir(), "clipboard-vault-dedupe-"));
+  const fresh = Buffer.concat([png2, Buffer.from([0])]);
+  const first = join(dedupeDir, "shot.png");
+  const second = join(dedupeDir, "截图副本.png");
+  const renamed = join(dedupeDir, "again.png");
+  try {
+    await writeFile(first, fresh);
+    await writeFile(second, fresh);
+    await writeFile(renamed, fresh);
+    plugin.settings.imageFileMode = "attachment";
+    const attachments = () => [...records.keys()].filter(path => path.includes("/attachments/")).length;
+    const base = attachments();
+    assert.equal(await plugin.store({ kind: "files", paths: [first] }, "b1".padEnd(64, "0")), "已保存");
+    assert.equal(attachments(), base + 1);
+    // Same bytes, different name and folder: recognised as a duplicate.
+    assert.equal(await plugin.store({ kind: "files", paths: [second] }, "b2".padEnd(64, "0")), "今日已保存相同内容");
+    assert.equal(attachments(), base + 1);
+    // A pasted bitmap of the same picture reuses the attachment written for the file.
+    const bytes = new Uint8Array(fresh);
+    assert.equal(await plugin.store({ kind: "image", bytes }, await plugin.fingerprint({ kind: "image", bytes })), "已保存");
+    assert.equal(attachments(), base + 1);
+    // A batch mixing a new path with an already stored picture writes no second copy.
+    assert.equal(await plugin.store({ kind: "files", paths: [renamed, "C:\\资料\\新文档.docx"] }, "b4".padEnd(64, "0")), "已保存");
+    assert.equal(attachments(), base + 1);
+    // The very same content copied again is skipped, and no second copy is written.
+    assert.equal(await plugin.store({ kind: "files", paths: [renamed] }, "b5".padEnd(64, "0")), "今日已保存相同内容");
+    assert.equal(attachments(), base + 1);
+    const hits = await plugin.search("", {}, 400);
+    assert.ok(hits.every(hit => hit.images.every(image => plugin.entryImage(hit, image) instanceof TFile)));
+  } finally {
+    for (const file of [first, second, renamed]) await unlink(file);
+    await rmdir(dedupeDir);
+  }
+}
+
+// Cleanup collects by date range and type, backs the note up, and only trashes owned, unreferenced images.
+const cleanupNote = "剪切板/1997/1997-01-01.md";
+const cleanupImage = "剪切板/1997/attachments/010000-bbbbbbbbbbbb.png";
+const cleanupHash = "b".repeat(64);
+await vault.createBinary(cleanupImage, png);
+await vault.create(cleanupNote,
+  "<!-- clipboard-vault:image:" + cleanupHash + " -->\n## 1. 01:00:00 · 图片\n\n![](attachments/010000-bbbbbbbbbbbb.png)\n\n" +
+  plainClip("Old text to clean", 2, "c") + "\n" + plainClip("Another old line", 3, "d"));
+const imageHits = await plugin.collectCleanupHits({ from: "1997-01-01", through: "1997-01-01" }, new Set(["image"]));
+assert.equal(imageHits.length, 1);
+assert.equal((await plugin.collectCleanupHits({ from: "1997-01-01", through: "1997-01-01" }, new Set(["text"]))).length, 2);
+assert.equal((await plugin.collectCleanupHits({ from: "1997-01-01", through: "1997-01-01" }, new Set())).length, 0);
+assert.equal((await plugin.collectCleanupHits({ from: "1996-01-01", through: "1996-12-31" }, new Set(["image", "text"]))).length, 0);
+assert.deepEqual(await plugin.cleanupStats(imageHits), { entries: 1, images: 1, bytes: 1234 });
+
+const cleanup = await plugin.applyCleanup(imageHits, true);
+assert.equal(cleanup.removed, 1);
+assert.equal(cleanup.trashed, 1);
+assert.equal(cleanup.skipped, 0);
+assert.ok(cleanup.backup.startsWith("剪切板/.cleanup-backup/"));
+const backupFile = records.get(`${cleanup.backup}/1997/1997-01-01.md`);
+assert.ok(backupFile && backupFile.content.includes("01:00:00 · 图片"));
+assert.ok(!records.has(cleanupImage));
+assert.ok(trashed.includes(cleanupImage));
+assert.ok(!records.get(cleanupNote).content.includes("· 图片"));
+assert.match(records.get(cleanupNote).content, /## 1\. 01:00:00 · 文本/);
+assert.match(records.get(cleanupNote).content, /## 2\. 01:00:00 · 文本/);
+// Backups never show up as archive entries.
+const visible = await plugin.search("", {}, 200);
+assert.ok(visible.length > 0);
+assert.ok(visible.every(hit => !hit.path.includes(".cleanup-backup")));
+
+const staleHits = await plugin.collectCleanupHits({ from: "1997-01-01", through: "1997-01-01" }, new Set(["text"]));
+records.get(cleanupNote).content = records.get(cleanupNote).content.replace("Old text to clean", "Changed after preview");
+const stale = await plugin.applyCleanup(staleHits, false);
+assert.equal(stale.removed, 1);
+assert.equal(stale.skipped, 1);
+assert.equal(stale.backup, undefined);
+assert.ok(records.get(cleanupNote).content.includes("Changed after preview"));
+assert.ok(!records.get(cleanupNote).content.includes("Another old line"));
+
+// A failed backup must abort cleanup before any selected archive content is removed.
+const backupFailureHits = await plugin.collectCleanupHits({ from: "1997-01-01", through: "1997-01-01" }, new Set(["text"]));
+assert.equal(backupFailureHits.length, 1);
+const beforeFailedBackup = records.get(cleanupNote).content;
+const createBeforeFailure = vault.create;
+const warnBeforeFailure = console.warn;
+try {
+  vault.create = async (path, content) => {
+    if (path.includes("/.cleanup-backup/")) throw new Error("Simulated backup write failure");
+    return createBeforeFailure(path, content);
+  };
+  console.warn = () => {};
+  await assert.rejects(() => plugin.applyCleanup(backupFailureHits, true), /清理前备份失败/);
+} finally {
+  vault.create = createBeforeFailure;
+  console.warn = warnBeforeFailure;
+}
+assert.equal(records.get(cleanupNote).content, beforeFailedBackup);
 
 // Timed pause and restart use a fake clock; no system clipboard or active Vault is touched.
 const originalNow = Date.now;
